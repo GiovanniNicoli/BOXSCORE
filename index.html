@@ -1,0 +1,1418 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Basketball Stat Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+      }
+    </style>
+    
+    <!-- React 18.2.0 (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    
+    <!-- JSPDF for PDF generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script>
+      // Shim to ensure autoTable can find jsPDF constructor
+      if (window.jspdf && window.jspdf.jsPDF) {
+        window.jsPDF = window.jspdf.jsPDF;
+      }
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.29/jspdf.plugin.autotable.min.js"></script>
+    
+    <!-- Babel Standalone for in-browser JSX/TS compilation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-slate-100 text-slate-800">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="typescript,react">
+      const { useState, useEffect, useCallback, useReducer, useRef } = React;
+
+      // --- CONSTANTS ---
+      const MAX_PLAYERS = 15;
+      const QUARTER_LENGTH_SEC = 10 * 60; // 10 minutes
+      const OVERTIME_LENGTH_SEC = 5 * 60; // 5 minutes
+
+      const SAMPLE_NAMES = [
+          'A. Rossi', 'B. Bianchi', 'C. Verdi', 'D. Neri', 'E. Gialli',
+          'F. Blu', 'G. Marrone', 'H. Rosa', 'I. Viola', 'J. Azzurro',
+          'K. Lilla', 'L. Arancio', 'M. Grigio', 'N. Celeste', 'O. Oro'
+      ];
+
+      // --- UTILS ---
+      const secToMinStr = (sec) => {
+          const m = Math.floor(sec / 60);
+          const s = sec % 60;
+          return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      };
+
+      const minStrToSec = (str) => {
+          if (!str) return 0;
+          const parts = str.split(':');
+          if (parts.length !== 2) return 0;
+          return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+      };
+
+      const formatTime = (sec) => {
+          const m = Math.floor(sec / 60);
+          const s = sec % 60;
+          return `${m.toString()}:${s.toString().padStart(2, '0')}`;
+      };
+
+      const getQuarterLabel = (q) => {
+          if (q <= 4) return `${q}°`;
+          return `OT${q - 4}`;
+      };
+
+      const getQuarterLength = (q) => {
+          return q > 4 ? OVERTIME_LENGTH_SEC : QUARTER_LENGTH_SEC;
+      };
+
+      const getGameStartSecondsForQuarter = (q) => {
+          if (q <= 1) return 0;
+          let total = 0;
+          // Add regular quarters
+          const regularQs = Math.min(q - 1, 4);
+          total += regularQs * QUARTER_LENGTH_SEC;
+          
+          // Add OT periods if any
+          if (q > 5) {
+             total += (q - 5) * OVERTIME_LENGTH_SEC;
+          }
+          return total;
+      };
+
+      const csvEscape = (val) => {
+          if (val === null || typeof val === 'undefined') return '""';
+          const s = String(val);
+          return '"' + s.replace(/"/g, '""') + '"';
+      };
+
+      const calculateAdvancedStats = (p, gameTotals) => {
+          const trb = p.offReb + p.defReb;
+          const fga = p.twoAtt + p.threeAtt;
+          const fgm = p.twoMade + p.threeMade;
+          const efg = fga > 0 ? (((fgm + 0.5 * p.threeMade) / fga) * 100).toFixed(1) : '-';
+          
+          const tsa = fga + 0.44 * p.freeAtt;
+          const ts = tsa > 0 ? ((p.points / (2 * tsa)) * 100).toFixed(1) : '-';
+          
+          let astToRatio;
+          if (p.turnover > 0) {
+              astToRatio = (p.assist / p.turnover).toFixed(2);
+          } else {
+              astToRatio = p.assist > 0 ? 'INF' : '0.00';
+          }
+          
+          const gmSc = (p.points + 0.4 * fgm - 0.7 * fga - 0.4 * (p.freeAtt - p.freeMade) + 0.7 * p.offReb + 0.3 * p.defReb + p.steal + 0.7 * p.assist + 0.7 * p.blocks - 0.4 * p.foul - p.turnover).toFixed(1);
+
+          const playerPIE = p.points + fgm + p.freeMade - fga - p.freeAtt + p.defReb + (0.5 * p.offReb) + p.assist + p.steal + (0.5 * p.blocks) - p.foul - p.turnover;
+          const gamePIE = gameTotals.pts + gameTotals.fgm + gameTotals.ftm - gameTotals.fga - gameTotals.fta + gameTotals.dreb + (0.5 * gameTotals.oreb) + gameTotals.ast + gameTotals.stl + (0.5 * gameTotals.blk) - gameTotals.pf - gameTotals.to;
+          const pie = gamePIE > 0 ? ((playerPIE / gamePIE) * 100).toFixed(1) : '-';
+
+          return { trb, efg, ts, astToRatio, gmSc, pie };
+      };
+
+      const exportBoxscoreCSV = (players, opponentStats, quarter) => {
+          const headers = [
+              "Name", "Minutes", "Points",
+              "2PT_Made", "2PT_Att", "2PT_%", "3PT_Made", "3PT_Att", "3PT_%", "FT_Made", "FT_Att", "FT_%",
+              "FG_Made", "FG_Att", "FG_%",
+              "Assist", "OffReb", "DefReb", "TRB", "Steal", "Blocks", "Turnover", "Fouls", "+/-",
+              "eFG%", "TS%", "AST/TO", "GmSc", "PIE",
+              "2PT_Miss", "3PT_Miss", "FT_Miss"
+          ];
+
+          const teamTotals = players.reduce((acc, p) => {
+              acc.points += p.points;
+              acc.twoMade += p.twoMade; acc.twoAtt += p.twoAtt;
+              acc.threeMade += p.threeMade; acc.threeAtt += p.threeAtt;
+              acc.freeMade += p.freeMade; acc.freeAtt += p.freeAtt;
+              acc.offReb += p.offReb; acc.defReb += p.defReb;
+              acc.assist += p.assist; acc.steal += p.steal;
+              acc.blocks += p.blocks; acc.foul += p.foul;
+              acc.turnover += p.turnover;
+              return acc;
+          }, { points: 0, twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0, offReb: 0, defReb: 0, assist: 0, steal: 0, blocks: 0, foul: 0, turnover: 0 });
+
+          const gameTotals = {
+              pts: teamTotals.points + (opponentStats.twoMade * 2 + opponentStats.threeMade * 3 + opponentStats.freeMade),
+              fgm: teamTotals.twoMade + teamTotals.threeMade + opponentStats.twoMade + opponentStats.threeMade,
+              fga: teamTotals.twoAtt + teamTotals.threeAtt + opponentStats.twoAtt + opponentStats.threeAtt,
+              ftm: teamTotals.freeMade + opponentStats.freeMade,
+              fta: teamTotals.freeAtt + opponentStats.freeAtt,
+              dreb: teamTotals.defReb + opponentStats.defReb,
+              oreb: teamTotals.offReb + opponentStats.offReb,
+              ast: teamTotals.assist + 0, 
+              stl: teamTotals.steal + 0, 
+              blk: teamTotals.blocks + opponentStats.blocks,
+              pf: teamTotals.foul + opponentStats.foul,
+              to: teamTotals.turnover + opponentStats.turnover,
+          };
+          
+          const rows = players.map(p => {
+              const twoPerc = p.twoAtt > 0 ? ((p.twoMade / p.twoAtt) * 100).toFixed(1) : '';
+              const threePerc = p.threeAtt > 0 ? ((p.threeMade / p.threeAtt) * 100).toFixed(1) : '';
+              const ftPerc = p.freeAtt > 0 ? ((p.freeMade / p.freeAtt) * 100).toFixed(1) : '';
+              const fgMade = p.twoMade + p.threeMade;
+              const fgAtt = p.twoAtt + p.threeAtt;
+              const fgPerc = fgAtt > 0 ? ((fgMade / fgAtt) * 100).toFixed(1) : '';
+              
+              const { trb, efg, ts, astToRatio, gmSc, pie } = calculateAdvancedStats(p, gameTotals);
+              
+              const twoMiss = p.twoAtt - p.twoMade;
+              const threeMiss = p.threeAtt - p.threeMade;
+              const ftMiss = p.freeAtt - p.freeMade;
+
+              return [
+                  p.name || `Player ${p.id + 1}`,
+                  secToMinStr(p.secondsPlayed),
+                  p.points,
+                  p.twoMade, p.twoAtt, twoPerc,
+                  p.threeMade, p.threeAtt, threePerc,
+                  p.freeMade, p.freeAtt, ftPerc,
+                  fgMade, fgAtt, fgPerc,
+                  p.assist, p.offReb, p.defReb, trb, p.steal, p.blocks, p.turnover, p.foul, p.plusMinus,
+                  efg, ts, astToRatio, gmSc, pie,
+                  twoMiss, threeMiss, ftMiss
+              ].map(csvEscape).join(',');
+          });
+          
+          // Opponent Row
+          const oppRows = [
+              "OPPONENT",
+              "", // Minutes
+              (opponentStats.twoMade * 2 + opponentStats.threeMade * 3 + opponentStats.freeMade), // Points
+              opponentStats.twoMade, opponentStats.twoAtt, "", 
+              opponentStats.threeMade, opponentStats.threeAtt, "",
+              opponentStats.freeMade, opponentStats.freeAtt, "",
+              "", "", "", // FG
+              "", opponentStats.offReb, opponentStats.defReb, (opponentStats.offReb + opponentStats.defReb), // Reb
+              "", opponentStats.blocks, opponentStats.turnover, opponentStats.foul, "",
+              "", "", "", "", "", // Adv stats
+              opponentStats.twoMiss, opponentStats.threeMiss, opponentStats.ftMiss
+          ].map(csvEscape).join(',');
+
+          const csvContent = [headers.map(csvEscape).join(','), ...rows, oppRows].join('\r\n');
+          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+          const quarterLabel = getQuarterLabel(quarter);
+          a.download = `boxscore_${quarterLabel}_${timestamp}.csv`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+      };
+
+      const generatePDF = (
+        teamName,
+        oppName,
+        players,
+        opponentStats,
+        events
+      ) => {
+        // Safe access to jsPDF
+        const jsPDF = window.jspdf ? window.jspdf.jsPDF : window.jsPDF;
+        if (!jsPDF) {
+          alert("PDF library not loaded correctly. Please refresh.");
+          return;
+        }
+
+        const doc = new jsPDF('p', 'mm', 'a4'); 
+
+        // PAGE 1: Summary
+        doc.setFontSize(16);
+        doc.setFont("helvetica", "bold");
+        doc.text(`${teamName.toUpperCase()} VS ${oppName.toUpperCase()}`, 105, 20, { align: 'center' });
+        
+        doc.setFontSize(12);
+        doc.setFont("helvetica", "normal");
+        const dateStr = new Date().toLocaleDateString();
+        doc.text(dateStr, 105, 30, { align: 'center' });
+
+        // Calculate Scores Logic
+        // Determine max quarter played
+        let maxQ = 4;
+        events.forEach(e => {
+            const regMatch = e.timestamp.match(/^(\d+)°/);
+            const otMatch = e.timestamp.match(/^OT(\d+)/);
+            if (regMatch) maxQ = Math.max(maxQ, parseInt(regMatch[1]));
+            if (otMatch) maxQ = Math.max(maxQ, 4 + parseInt(otMatch[1]));
+        });
+
+        // Initialize score arrays
+        const qScores = { team: Array(maxQ).fill(0), opp: Array(maxQ).fill(0) };
+        
+        events.forEach(e => {
+            let q = 1;
+            const regMatch = e.timestamp.match(/^(\d+)°/);
+            const otMatch = e.timestamp.match(/^OT(\d+)/);
+            if (regMatch) q = parseInt(regMatch[1]);
+            else if (otMatch) q = 4 + parseInt(otMatch[1]);
+            
+            if (q >= 1 && q <= maxQ) {
+                qScores.team[q-1] += e.teamDelta;
+                qScores.opp[q-1] += e.oppDelta;
+            }
+        });
+
+        const teamTotal = qScores.team.reduce((a,b)=>a+b, 0);
+        const oppTotal = qScores.opp.reduce((a,b)=>a+b, 0);
+
+        // Dynamic Header
+        const scoreTableHead = ['TABELLINO'];
+        for(let i=1; i<=maxQ; i++) {
+            scoreTableHead.push(getQuarterLabel(i));
+        }
+        scoreTableHead.push('TOT');
+
+        doc.autoTable({
+            startY: 40,
+            head: [scoreTableHead],
+            body: [
+                [oppName, ...qScores.opp, oppTotal],
+                [teamName, ...qScores.team, teamTotal]
+            ],
+            theme: 'grid',
+            headStyles: { fillColor: [220, 220, 220], textColor: 0, fontStyle: 'bold' },
+            styles: { halign: 'center', textColor: 0 }
+        });
+
+        // Stats Logic
+        const tt = players.reduce((acc, p) => {
+              acc.twoMade += p.twoMade; acc.twoAtt += p.twoAtt;
+              acc.threeMade += p.threeMade; acc.threeAtt += p.threeAtt;
+              acc.freeMade += p.freeMade; acc.freeAtt += p.freeAtt;
+              acc.offReb += p.offReb; acc.defReb += p.defReb;
+              acc.assist += p.assist; acc.steal += p.steal;
+              acc.blocks += p.blocks; acc.foul += p.foul;
+              acc.turnover += p.turnover;
+              return acc;
+          }, { twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0, offReb: 0, defReb: 0, assist: 0, steal: 0, blocks: 0, foul: 0, turnover: 0 });
+
+        const formatPct = (m, a) => a > 0 ? (m/a*100).toFixed(1) : '0.0';
+
+        const teamStatsBody = [
+            ['2P', tt.twoMade, tt.twoAtt, formatPct(tt.twoMade, tt.twoAtt)],
+            ['3P', tt.threeMade, tt.threeAtt, formatPct(tt.threeMade, tt.threeAtt)],
+            ['TIRI DAL CAMPO', tt.twoMade+tt.threeMade, tt.twoAtt+tt.threeAtt, formatPct(tt.twoMade+tt.threeMade, tt.twoAtt+tt.threeAtt)],
+            ['LIBERI', tt.freeMade, tt.freeAtt, formatPct(tt.freeMade, tt.freeAtt)],
+            ['RIMBALZI', tt.offReb+tt.defReb, '', ''],
+            ['RIMBALZI DIFENSIVI', tt.defReb, '', ''],
+            ['RIMBALZI OFFENSIVI', tt.offReb, '', ''],
+            ['ASSIST', tt.assist, '', ''],
+            ['PALLE PERSE', tt.turnover, '', ''],
+            ['PALLE RECUPERATE', tt.steal, '', ''],
+            ['STOPPATE', tt.blocks, '', '']
+        ];
+
+        const os = opponentStats;
+        const oppStatsBody = [
+            ['2P', os.twoMade, os.twoAtt, formatPct(os.twoMade, os.twoAtt)],
+            ['3P', os.threeMade, os.threeAtt, formatPct(os.threeMade, os.threeAtt)],
+            ['TIRI DAL CAMPO', os.twoMade+os.threeMade, os.twoAtt+os.threeAtt, formatPct(os.twoMade+os.threeMade, os.twoAtt+os.threeAtt)],
+            ['LIBERI', os.freeMade, os.freeAtt, formatPct(os.freeMade, os.freeAtt)],
+            ['RIMBALZI', os.offReb+os.defReb, '', ''],
+            ['RIMBALZI DIFENSIVI', os.defReb, '', ''],
+            ['RIMBALZI OFFENSIVI', os.offReb, '', ''],
+            ['ASSIST', '-', '', ''],
+            ['PALLE PERSE', os.turnover, '', ''],
+            ['PALLE RECUPERATE', '-', '', ''],
+            ['STOPPATE', os.blocks, '', '']
+        ];
+
+        let finalY = doc.lastAutoTable.finalY + 15;
+
+        doc.autoTable({
+            startY: finalY,
+            head: [[teamName.toUpperCase(), 'SEGNATI', 'TENTATI', '%']],
+            body: teamStatsBody,
+            theme: 'grid',
+            headStyles: { fillColor: [220, 220, 220], textColor: 0 },
+            columnStyles: { 0: { fontStyle: 'bold' } },
+            styles: { textColor: 0 }
+        });
+        
+        let nextY = doc.lastAutoTable.finalY + 10;
+        if (nextY > 250) {
+            doc.addPage();
+            nextY = 20;
+        }
+
+        doc.autoTable({
+            startY: nextY,
+            head: [[oppName.toUpperCase(), 'SEGNATI', 'TENTATI', '%']],
+            body: oppStatsBody,
+            theme: 'grid',
+            headStyles: { fillColor: [220, 220, 220], textColor: 0 },
+            columnStyles: { 0: { fontStyle: 'bold' } },
+            styles: { textColor: 0 }
+        });
+
+        // PAGE 2: Box Score (Landscape)
+        doc.addPage('a4', 'landscape');
+        doc.text('BOX SCORE', 14, 15);
+        
+        const gameTotals = {
+              pts: teamTotal + oppTotal,
+              fgm: tt.twoMade + tt.threeMade + os.twoMade + os.threeMade,
+              fga: tt.twoAtt + tt.threeAtt + os.twoAtt + os.threeAtt,
+              ftm: tt.freeMade + os.freeMade,
+              fta: tt.freeAtt + os.freeAtt,
+              dreb: tt.defReb + os.defReb,
+              oreb: tt.offReb + os.offReb,
+              ast: tt.assist, 
+              stl: tt.steal, 
+              blk: tt.blocks + os.blocks,
+              pf: tt.foul + os.foul,
+              to: tt.turnover + os.turnover,
+          };
+
+        const boxBody = players.filter(p => p.secondsPlayed > 0 || p.name).map(p => {
+            const { trb, efg, ts, astToRatio, gmSc, pie } = calculateAdvancedStats(p, gameTotals);
+            return [
+              p.name || `Player ${p.id+1}`,
+              secToMinStr(p.secondsPlayed),
+              p.points,
+              `${p.twoMade}/${p.twoAtt}`,
+              formatPct(p.twoMade, p.twoAtt),
+              `${p.threeMade}/${p.threeAtt}`,
+              formatPct(p.threeMade, p.threeAtt),
+              `${p.freeMade}/${p.freeAtt}`,
+              formatPct(p.freeMade, p.freeAtt),
+              `${p.twoMade+p.threeMade}/${p.twoAtt+p.threeAtt}`,
+              formatPct(p.twoMade+p.threeMade, p.twoAtt+p.threeAtt),
+              p.assist, p.offReb, p.defReb, trb, p.steal, p.blocks, p.turnover, p.foul, p.plusMinus,
+              efg + '%', ts + '%', astToRatio, gmSc, pie + '%'
+            ];
+        });
+        
+        doc.autoTable({
+            startY: 20,
+            head: [[
+              'Name', 'Min', 'Pts', '2P', '%', '3P', '%', 'FT', '%', 'FG', '%', 'Ast', 'OR', 'DR', 'TR', 'Stl', 'Blk', 'TO', 'PF', '+/-', 'eFG', 'TS', 'A/T', 'GmSc', 'PIE'
+            ]],
+            body: boxBody,
+            theme: 'grid',
+            headStyles: { fillColor: [220, 220, 220], textColor: 0, fontSize: 8 },
+            styles: { fontSize: 8, cellPadding: 1, textColor: 0 }
+        });
+
+        // PAGE 3: Chart
+        doc.addPage('a4', 'portrait');
+        doc.text('Score Difference Chart', 14, 15);
+        
+        let dataPoints = [{ time: 0, diff: 0 }];
+        // Calculate total game duration dynamically based on maxQ
+        const totalGameSeconds = getGameStartSecondsForQuarter(maxQ + 1); // Get start of next theoretical period to get full duration
+        
+        events.forEach(e => {
+            const prevPoint = dataPoints[dataPoints.length - 1];
+            if (e.totalSecondsElapsed > prevPoint.time) {
+                dataPoints.push({ time: e.totalSecondsElapsed, diff: prevPoint.diff });
+            }
+            const newDiff = (e.teamScoreSnapshot + e.teamDelta) - (e.oppScoreSnapshot + e.oppDelta);
+            dataPoints.push({ time: e.totalSecondsElapsed, diff: newDiff });
+        });
+        const lastTime = dataPoints[dataPoints.length-1].time;
+        if (lastTime < totalGameSeconds) {
+            dataPoints.push({ time: lastTime, diff: dataPoints[dataPoints.length-1].diff });
+        }
+
+        const startX = 20;
+        const endX = 190;
+        const width = endX - startX;
+        const startY = 100;
+        const height = 60;
+        
+        const maxDiff = Math.max(10, ...dataPoints.map(p => Math.abs(p.diff))) + 2;
+        const scaleY = (val) => startY - (val / maxDiff) * (height / 2);
+        const scaleX = (t) => startX + (t / totalGameSeconds) * width;
+        
+        doc.setDrawColor(200, 200, 200);
+        doc.line(startX, startY, endX, startY);
+        
+        doc.setDrawColor(0, 0, 255);
+        doc.setLineWidth(0.5);
+        
+        for (let i = 1; i < dataPoints.length; i++) {
+            const p1 = dataPoints[i-1];
+            const p2 = dataPoints[i];
+            doc.line(scaleX(p1.time), scaleY(p1.diff), scaleX(p2.time), scaleY(p2.diff));
+        }
+        
+        doc.setFontSize(10);
+        doc.text(`+${maxDiff}`, startX - 2, startY - (height/2));
+        doc.text(`-${maxDiff}`, startX - 2, startY + (height/2));
+        doc.text("0", startX - 5, startY);
+        
+        // Dynamic Period Labels on Chart
+        for(let q=1; q<=maxQ; q++) {
+             // Draw label at end of each period
+             const periodEndSec = getGameStartSecondsForQuarter(q + 1);
+             const label = getQuarterLabel(q);
+             doc.text(label, scaleX(periodEndSec), startY + (height/2) + 5, {align: 'center'});
+             // Draw vertical grid line
+             doc.setDrawColor(230, 230, 230);
+             doc.line(scaleX(periodEndSec), startY - height/2, scaleX(periodEndSec), startY + height/2);
+        }
+
+        doc.save(`${teamName}_vs_${oppName}_report.pdf`);
+      };
+
+      // --- HOOKS ---
+      const useGameTimer = (initialSeconds, onTick) => {
+          const [timeLeft, setTimeLeft] = useState(initialSeconds);
+          const [isRunning, setIsRunning] = useState(false);
+          const intervalRef = useRef(null);
+
+          const tick = useCallback(() => {
+              setTimeLeft(prev => {
+                  if (prev > 0) {
+                      onTick();
+                      return prev - 1;
+                  }
+                  setIsRunning(false);
+                  return 0;
+              });
+          }, [onTick]);
+
+          useEffect(() => {
+              if (isRunning) {
+                  intervalRef.current = window.setInterval(tick, 1000);
+              } else {
+                  if (intervalRef.current) {
+                      clearInterval(intervalRef.current);
+                  }
+              }
+
+              return () => {
+                  if (intervalRef.current) {
+                      clearInterval(intervalRef.current);
+                  }
+              };
+          }, [isRunning, tick]);
+
+          const toggleTimer = useCallback(() => {
+              setIsRunning(prev => !prev);
+          }, []);
+
+          const resetTimer = useCallback(() => {
+              setIsRunning(false);
+              setTimeLeft(initialSeconds);
+          }, [initialSeconds]);
+
+          const setTime = useCallback((seconds) => {
+              setTimeLeft(seconds);
+          }, []);
+
+          return { timeLeft, isRunning, toggleTimer, resetTimer, setTime };
+      };
+
+      // --- COMPONENTS (Icons) ---
+      const PlayIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+          </svg>
+      );
+
+      const PauseIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h1a1 1 0 001-1V8a1 1 0 00-1-1H8zm3 0a1 1 0 00-1 1v4a1 1 0 001 1h1a1 1 0 001-1V8a1 1 0 00-1-1h-1z" clipRule="evenodd" />
+          </svg>
+      );
+
+      const ResetIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 9a9 9 0 0114.13-5.87M20 15a9 9 0 01-14.13 5.87" />
+          </svg>
+      );
+
+      const DownloadIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+      );
+
+      const TrashIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+          </svg>
+      );
+
+      const UndoIcon = () => (
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0019 16V8a1 1 0 00-1.6-.8l-5.333 4zM4.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0011 16V8a1 1 0 00-1.6-.8l-5.334 4z" />
+          </svg>
+      );
+
+      const UserGroupIcon = () => (
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.653-.122-1.28-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.653.122-1.28.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+        </svg>
+      );
+
+      const SparklesIcon = () => (
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+        </svg>
+      );
+
+      const ExportIcon = () => (
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+        </svg>
+      );
+      
+      const ImportIcon = () => (
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+        </svg>
+      );
+
+      // --- COMPONENTS ---
+
+      // TimerControl Components
+      const QuickStatButton = ({ label, onClick, className }) => (
+          <button onClick={onClick} className={`px-2.5 py-1.5 text-xs font-semibold rounded-md transition-colors bg-slate-100 text-slate-700 hover:bg-slate-200 ${className || ''}`}>
+              {label}
+          </button>
+      );
+
+      const OppStatButton = ({ label, count, onClick }) => (
+          <button onClick={onClick} className="px-2.5 py-1.5 text-xs font-semibold rounded-md transition-colors bg-slate-100 text-slate-700 hover:bg-slate-200">
+              {label}: <span className="font-bold text-slate-800">{count}</span>
+          </button>
+      );
+
+      const TimerControl = ({
+          timeLeft, isRunning, currentQuarter, teamScore, oppScore, opponentStats,
+          onToggleTimer, onResetTimer, onSetTime, onQuarterChange,
+          onOpponentEvent, onAdjustScore, onUndo
+      }) => {
+          const [manualMin, setManualMin] = useState('');
+          const [manualSec, setManualSec] = useState('');
+
+          const applyManualTime = () => {
+              const minutes = parseInt(manualMin, 10) || 0;
+              const seconds = parseInt(manualSec, 10) || 0;
+              onSetTime(minutes * 60 + seconds);
+              setManualMin('');
+              setManualSec('');
+          };
+
+          return (
+              <div className="bg-white rounded-xl shadow-md p-4 sm:p-6 space-y-6">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                      <div className="flex items-center gap-4">
+                          <div className="font-mono text-5xl font-bold text-slate-800 tracking-tighter">
+                              {formatTime(timeLeft)}
+                          </div>
+                          <div>
+                              <button onClick={onToggleTimer} className="p-2 rounded-full bg-blue-600 text-white hover:bg-blue-700 transition-colors">
+                                  {isRunning ? <PauseIcon /> : <PlayIcon />}
+                              </button>
+                              <button onClick={onResetTimer} className="p-2 ml-2 rounded-full bg-slate-200 text-slate-700 hover:bg-slate-300 transition-colors">
+                                  <ResetIcon />
+                              </button>
+                          </div>
+                      </div>
+                      <div className="flex items-center gap-4 text-center">
+                          <div className="p-3 rounded-lg bg-slate-100">
+                              <div className="text-sm font-semibold text-slate-600">TEAM</div>
+                              <div className="text-3xl font-bold text-slate-800">{teamScore}</div>
+                          </div>
+                          <div className="p-3 rounded-lg bg-slate-100">
+                              <div className="text-sm font-semibold text-slate-600">OPP</div>
+                              <div className="text-3xl font-bold text-slate-800">{oppScore}</div>
+                          </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                          <span className="text-sm text-slate-500">Period:</span>
+                          <select value={currentQuarter} onChange={(e) => onQuarterChange(parseInt(e.target.value))} className="p-1.5 rounded-md border-slate-300 text-sm focus:ring-indigo-500 focus:border-indigo-500">
+                              {[1, 2, 3, 4, 5, 6, 7, 8].map(q => <option key={q} value={q}>{getQuarterLabel(q)}</option>)}
+                          </select>
+                      </div>
+                  </div>
+
+                  <div className="space-y-3 pt-4 border-t border-slate-200">
+                      <div className="flex justify-between items-center">
+                          <h3 className="text-sm font-semibold text-slate-600 uppercase tracking-wider">Opponent Actions</h3>
+                           <button onClick={onUndo} className="flex items-center gap-2 px-2.5 py-1.5 text-xs font-semibold rounded-md transition-colors bg-red-100 text-red-700 hover:bg-red-200">
+                            <UndoIcon />
+                            Undo Last
+                          </button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs text-slate-500 font-semibold w-12 text-right pr-2">SCORE:</span>
+                          <QuickStatButton label="Opp +2" onClick={() => onOpponentEvent('2made')} />
+                          <QuickStatButton label="Opp +3" onClick={() => onOpponentEvent('3made')} />
+                          <QuickStatButton label="Opp FT +1" onClick={() => onOpponentEvent('ftMade')} />
+                      </div>
+                       <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs text-slate-500 font-semibold w-12 text-right pr-2">STATS:</span>
+                          <OppStatButton label="O.Reb" count={opponentStats.offReb} onClick={() => onOpponentEvent('offReb')} />
+                          <OppStatButton label="D.Reb" count={opponentStats.defReb} onClick={() => onOpponentEvent('defReb')} />
+                          <OppStatButton label="Fouls" count={opponentStats.foul} onClick={() => onOpponentEvent('foul')} />
+                          <OppStatButton label="T.O." count={opponentStats.turnover} onClick={() => onOpponentEvent('turnover')} />
+                          <OppStatButton label="Block" count={opponentStats.blocks} onClick={() => onOpponentEvent('block')} />
+                      </div>
+                       <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs text-slate-500 font-semibold w-12 text-right pr-2">MISSES:</span>
+                          <OppStatButton label="2P Miss" count={opponentStats.twoMiss} onClick={() => onOpponentEvent('2miss')} />
+                          <OppStatButton label="3P Miss" count={opponentStats.threeMiss} onClick={() => onOpponentEvent('3miss')} />
+                          <OppStatButton label="FT Miss" count={opponentStats.ftMiss} onClick={() => onOpponentEvent('ftMiss')} />
+                      </div>
+                  </div>
+
+                  <div className="space-y-3 pt-4 border-t border-slate-200">
+                       <h3 className="text-sm font-semibold text-slate-600 uppercase tracking-wider">Manual Adjustments</h3>
+                       <div className="flex flex-wrap gap-2 items-center">
+                          <span className="text-sm text-slate-500">Time (MM:SS):</span>
+                          <input type="number" placeholder="MM" value={manualMin} onChange={(e) => setManualMin(e.target.value)} className="w-16 p-1.5 text-sm border-slate-300 rounded-md focus:ring-indigo-500"/>
+                          <span>:</span>
+                          <input type="number" placeholder="SS" value={manualSec} onChange={(e) => setManualSec(e.target.value)} className="w-16 p-1.5 text-sm border-slate-300 rounded-md focus:ring-indigo-500"/>
+                          <button onClick={applyManualTime} className="px-3 py-1.5 text-sm font-semibold rounded-md bg-slate-600 text-white hover:bg-slate-700">Set</button>
+                      </div>
+                      <div className="flex flex-wrap gap-2 items-center">
+                          <span className="text-sm text-slate-500">Score:</span>
+                          <QuickStatButton label="Team +1" onClick={() => onAdjustScore('team', 1)} />
+                          <QuickStatButton label="Team -1" onClick={() => onAdjustScore('team', -1)} />
+                          <QuickStatButton label="Opp +1" onClick={() => onAdjustScore('opp', 1)} />
+                          <QuickStatButton label="Opp -1" onClick={() => onAdjustScore('opp', -1)} />
+                      </div>
+                  </div>
+              </div>
+          );
+      };
+
+      // PlayByPlay Component
+      const PlayByPlay = ({ events, onClear }) => {
+          const playByPlayText = events
+              .map((e, i) => `${i + 1}. ${e.timestamp} - ${e.description} (Score ${e.teamScoreSnapshot}-${e.oppScoreSnapshot})`)
+              .reverse()
+              .join('\n');
+
+          const downloadPlayByPlay = () => {
+              const blob = new Blob([playByPlayText], { type: 'text/plain;charset=utf-8' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `play_by_play_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+          };
+
+          return (
+              <div className="bg-white rounded-xl shadow-md p-4 sm:p-6 h-full flex flex-col">
+                  <h2 className="text-xl font-bold text-slate-800 mb-2">Play-by-Play</h2>
+                  <textarea
+                      readOnly
+                      value={playByPlayText}
+                      placeholder="Game events will appear here..."
+                      className="w-full flex-grow bg-slate-50 rounded-lg p-3 text-sm font-mono border border-slate-200 focus:ring-blue-500 focus:border-blue-500 resize-none"
+                  />
+                  <div className="flex items-center justify-between mt-3">
+                      <span className="text-sm text-slate-500">Total Events: {events.length}</span>
+                      <div className="flex items-center gap-2">
+                          <button
+                              onClick={downloadPlayByPlay}
+                              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition-colors"
+                          >
+                             <DownloadIcon />
+                          </button>
+                          <button
+                              onClick={onClear}
+                              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded-lg hover:bg-red-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors"
+                          >
+                             <TrashIcon />
+                          </button>
+                      </div>
+                  </div>
+              </div>
+          );
+      };
+
+      // PlayerCard Component
+      const PlayerCard = ({ player, onPlayerEvent, onToggleOnCourt, onUpdatePlayerName }) => {
+          const statButtons = [
+              { label: '2P+', stat: '2made' }, { label: '2P-', stat: '2miss' },
+              { label: '3P+', stat: '3made' }, { label: '3P-', stat: '3miss' },
+              { label: 'FT+', stat: 'ftMade' }, { label: 'FT-', stat: 'ftMiss' },
+              { label: 'AST', stat: 'assist' }, { label: 'OREB', stat: 'offReb' },
+              { label: 'DREB', stat: 'defReb' }, { label: 'STL', stat: 'steal' },
+              { label: 'TO', stat: 'turnover' }, { label: 'FOUL', stat: 'foul' },
+              { label: 'BLK', stat: 'block' },
+          ];
+
+          return (
+              <div className={`flex-shrink-0 w-64 p-3 rounded-lg shadow-sm transition-all duration-200 ${player.onCourt ? 'bg-green-50 border-2 border-green-500' : 'bg-white border'}`}>
+                  <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                          <input
+                              type="checkbox"
+                              checked={player.onCourt}
+                              onChange={() => onToggleOnCourt(player.id)}
+                              className="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                          />
+                          <input
+                              type="text"
+                              value={player.name}
+                              onChange={(e) => onUpdatePlayerName(player.id, e.target.value)}
+                              placeholder={`Player ${player.id + 1}`}
+                              className="text-sm font-semibold p-1 rounded-md border-gray-300 w-32 focus:ring-indigo-500 focus:border-indigo-500"
+                          />
+                      </div>
+                      <div className={`text-xs font-mono px-2 py-1 rounded ${player.onCourt ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-600'}`}>
+                          {secToMinStr(player.secondsPlayed)}
+                      </div>
+                  </div>
+                  <div className="grid grid-cols-4 gap-2">
+                      {statButtons.map(({ label, stat }) => (
+                          <button
+                              key={stat}
+                              onClick={() => onPlayerEvent(player.id, stat)}
+                              className={`px-2 py-1.5 text-xs font-semibold rounded-md transition-colors ${
+                                  label.includes('+') ? 'bg-blue-100 text-blue-800 hover:bg-blue-200' :
+                                  label.includes('-') ? 'bg-red-100 text-red-800 hover:bg-red-200' :
+                                  'bg-slate-100 text-slate-800 hover:bg-slate-200'
+                              }`}
+                          >
+                              {label}
+                          </button>
+                      ))}
+                  </div>
+              </div>
+          );
+      };
+
+      // PlayersList Component
+      const PlayersList = ({
+          players,
+          onPlayerEvent,
+          onToggleOnCourt,
+          onUpdatePlayerName,
+          onAutoFillNames,
+          onSetFiveOnCourt,
+      }) => {
+          const sortedPlayers = [...players].sort((a, b) => {
+              if (a.onCourt === b.onCourt) return a.id - b.id;
+              return a.onCourt ? -1 : 1;
+          });
+
+          return (
+              <div className="bg-white rounded-xl shadow-md p-4 sm:p-6">
+                  <div className="flex items-center justify-between mb-4">
+                      <h2 className="text-xl font-bold text-slate-800">Players</h2>
+                      <div className="flex items-center gap-2">
+                          <button
+                              onClick={onAutoFillNames}
+                              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition-colors"
+                          >
+                              <SparklesIcon />
+                              Auto-fill Names
+                          </button>
+                          <button
+                              onClick={onSetFiveOnCourt}
+                              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition-colors"
+                          >
+                              <UserGroupIcon />
+                              Set 5 on Court
+                          </button>
+                      </div>
+                  </div>
+                  <div className="flex overflow-x-auto space-x-4 pb-4">
+                      {sortedPlayers.map((player) => (
+                          <PlayerCard
+                              key={player.id}
+                              player={player}
+                              onPlayerEvent={onPlayerEvent}
+                              onToggleOnCourt={onToggleOnCourt}
+                              onUpdatePlayerName={onUpdatePlayerName}
+                          />
+                      ))}
+                  </div>
+              </div>
+          );
+      };
+
+      // BoxScore Component
+      const BoxScore = ({ players, opponentStats, onExport, onImport }) => {
+          const fileInputRef = useRef(null);
+          
+          const renderStat = (made, attempted) => {
+              const percentage = attempted > 0 ? ((made / attempted) * 100).toFixed(1) : '0.0';
+              return `${made}/${attempted} (${percentage}%)`;
+          };
+
+          const teamTotals = players.reduce((acc, p) => {
+              acc.points += p.points;
+              acc.twoMade += p.twoMade; acc.twoAtt += p.twoAtt;
+              acc.threeMade += p.threeMade; acc.threeAtt += p.threeAtt;
+              acc.freeMade += p.freeMade; acc.freeAtt += p.freeAtt;
+              acc.offReb += p.offReb; acc.defReb += p.defReb;
+              acc.assist += p.assist; acc.steal += p.steal;
+              acc.blocks += p.blocks; acc.foul += p.foul;
+              acc.turnover += p.turnover;
+              return acc;
+          }, { points: 0, twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0, offReb: 0, defReb: 0, assist: 0, steal: 0, blocks: 0, foul: 0, turnover: 0 });
+
+          const gameTotals = {
+              pts: teamTotals.points + (opponentStats.twoMade * 2 + opponentStats.threeMade * 3 + opponentStats.freeMade),
+              fgm: teamTotals.twoMade + teamTotals.threeMade + opponentStats.twoMade + opponentStats.threeMade,
+              fga: teamTotals.twoAtt + teamTotals.threeAtt + opponentStats.twoAtt + opponentStats.threeAtt,
+              ftm: teamTotals.freeMade + opponentStats.freeMade,
+              fta: teamTotals.freeAtt + opponentStats.freeAtt,
+              dreb: teamTotals.defReb + opponentStats.defReb,
+              oreb: teamTotals.offReb + opponentStats.offReb,
+              ast: teamTotals.assist + 0, 
+              stl: teamTotals.steal + 0, 
+              blk: teamTotals.blocks + opponentStats.blocks,
+              pf: teamTotals.foul + opponentStats.foul,
+              to: teamTotals.turnover + opponentStats.turnover,
+          };
+
+          return (
+              <div className="bg-white rounded-xl shadow-md p-4 sm:p-6">
+                  <div className="flex items-center justify-between mb-4">
+                      <h2 className="text-xl font-bold text-slate-800">Box Score</h2>
+                      <div className="flex gap-2">
+                        <input
+                            type="file"
+                            accept=".csv"
+                            ref={fileInputRef}
+                            style={{ display: 'none' }}
+                            onChange={onImport}
+                        />
+                        <button
+                            onClick={() => fileInputRef.current?.click()}
+                            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition-colors"
+                        >
+                            <ImportIcon />
+                            Import CSV
+                        </button>
+                        <button
+                            onClick={onExport}
+                            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
+                        >
+                            <ExportIcon />
+                            Export CSV
+                        </button>
+                      </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                      <table className="w-full text-sm text-left text-slate-500">
+                          <thead className="text-xs text-slate-700 uppercase bg-slate-100">
+                              <tr>
+                                  <th scope="col" className="px-4 py-3">Player</th>
+                                  <th scope="col" className="px-4 py-3 text-center">MIN</th>
+                                  <th scope="col" className="px-4 py-3 text-center">PTS</th>
+                                  <th scope="col" className="px-4 py-3">2PT</th>
+                                  <th scope="col" className="px-4 py-3">3PT</th>
+                                  <th scope="col" className="px-4 py-3">FT</th>
+                                  <th scope="col" className="px-4 py-3">FG</th>
+                                  <th scope="col" className="px-4 py-3 text-center">AST</th>
+                                  <th scope="col" className="px-4 py-3 text-center">OREB</th>
+                                  <th scope="col" className="px-4 py-3 text-center">DREB</th>
+                                  <th scope="col" className="px-4 py-3 text-center">TRB</th>
+                                  <th scope="col" className="px-4 py-3 text-center">STL</th>
+                                  <th scope="col" className="px-4 py-3 text-center">BLK</th>
+                                  <th scope="col" className="px-4 py-3 text-center">TO</th>
+                                  <th scope="col" className="px-4 py-3 text-center">FLS</th>
+                                  <th scope="col" className="px-4 py-3 text-center">+/-</th>
+                                  <th scope="col" className="px-4 py-3 text-center">eFG%</th>
+                                  <th scope="col" className="px-4 py-3 text-center">TS%</th>
+                                  <th scope="col" className="px-4 py-3 text-center">AST/TO</th>
+                                  <th scope="col" className="px-4 py-3 text-center">GmSc</th>
+                                  <th scope="col" className="px-4 py-3 text-center">PIE</th>
+                              </tr>
+                          </thead>
+                          <tbody>
+                              {players.filter(p => p.name || p.secondsPlayed > 0).map((p) => {
+                                  const { trb, efg, ts, astToRatio, gmSc, pie } = calculateAdvancedStats(p, gameTotals);
+                                  return (
+                                      <tr key={p.id} className="bg-white border-b hover:bg-slate-50">
+                                          <th scope="row" className="px-4 py-3 font-medium text-slate-900 whitespace-nowrap">{p.name || `Player ${p.id + 1}`}</th>
+                                          <td className="px-4 py-3 text-center">{secToMinStr(p.secondsPlayed)}</td>
+                                          <td className="px-4 py-3 text-center font-semibold text-slate-800">{p.points}</td>
+                                          <td className="px-4 py-3 whitespace-nowrap">{renderStat(p.twoMade, p.twoAtt)}</td>
+                                          <td className="px-4 py-3 whitespace-nowrap">{renderStat(p.threeMade, p.threeAtt)}</td>
+                                          <td className="px-4 py-3 whitespace-nowrap">{renderStat(p.freeMade, p.freeAtt)}</td>
+                                          <td className="px-4 py-3 whitespace-nowrap">{renderStat(p.twoMade + p.threeMade, p.twoAtt + p.threeAtt)}</td>
+                                          <td className="px-4 py-3 text-center">{p.assist}</td>
+                                          <td className="px-4 py-3 text-center">{p.offReb}</td>
+                                          <td className="px-4 py-3 text-center">{p.defReb}</td>
+                                          <td className="px-4 py-3 text-center">{trb}</td>
+                                          <td className="px-4 py-3 text-center">{p.steal}</td>
+                                          <td className="px-4 py-3 text-center">{p.blocks}</td>
+                                          <td className="px-4 py-3 text-center">{p.turnover}</td>
+                                          <td className="px-4 py-3 text-center">{p.foul}</td>
+                                          <td className={`px-4 py-3 text-center font-medium ${p.plusMinus > 0 ? 'text-green-600' : p.plusMinus < 0 ? 'text-red-600' : 'text-slate-500'}`}>{p.plusMinus > 0 ? `+${p.plusMinus}`: p.plusMinus}</td>
+                                          <td className="px-4 py-3 text-center">{efg}</td>
+                                          <td className="px-4 py-3 text-center">{ts}</td>
+                                          <td className="px-4 py-3 text-center">{astToRatio}</td>
+                                          <td className="px-4 py-3 text-center">{gmSc}</td>
+                                          <td className="px-4 py-3 text-center font-semibold">{pie}</td>
+                                      </tr>
+                                  );
+                              })}
+                          </tbody>
+                      </table>
+                  </div>
+              </div>
+          );
+      };
+
+      // TeamTotals Component
+      const TeamTotals = ({ players, opponentStats }) => {
+          const teamTotals = players.reduce(
+              (acc, p) => {
+                  acc.twoMade += p.twoMade;
+                  acc.twoAtt += p.twoAtt;
+                  acc.threeMade += p.threeMade;
+                  acc.threeAtt += p.threeAtt;
+                  acc.freeMade += p.freeMade;
+                  acc.freeAtt += p.freeAtt;
+                  acc.offReb += p.offReb;
+                  acc.defReb += p.defReb;
+                  acc.foul += p.foul;
+                  acc.blocks += p.blocks;
+                  return acc;
+              },
+              { twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0, offReb: 0, defReb: 0, foul: 0, blocks: 0 }
+          );
+
+          const renderStatLine = (stats) => {
+              const pct = (made, att) => (att > 0 ? ((made / att) * 100).toFixed(1) + '%' : '-');
+              return (
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-3 gap-4 text-sm text-slate-600">
+                      <p><strong>2PT:</strong> {stats.twoMade}/{stats.twoAtt} ({pct(stats.twoMade, stats.twoAtt)})</p>
+                      <p><strong>3PT:</strong> {stats.threeMade}/{stats.threeAtt} ({pct(stats.threeMade, stats.threeAtt)})</p>
+                      <p><strong>FT:</strong> {stats.freeMade}/{stats.freeAtt} ({pct(stats.freeMade, stats.freeAtt)})</p>
+                      <p><strong>Rebounds:</strong> {stats.offReb} Off / {stats.defReb} Def</p>
+                      <p><strong>Fouls:</strong> {stats.foul}</p>
+                      <p><strong>Blocks:</strong> {stats.blocks}</p>
+                  </div>
+              );
+          };
+
+          return (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-white rounded-xl shadow-md p-4 sm:p-6">
+                      <h3 className="text-lg font-bold text-slate-800 mb-3">Your Team Totals</h3>
+                      {renderStatLine(teamTotals)}
+                  </div>
+                  <div className="bg-white rounded-xl shadow-md p-4 sm:p-6">
+                      <h3 className="text-lg font-bold text-slate-800 mb-3">Opponent Totals</h3>
+                      {renderStatLine(opponentStats)}
+                  </div>
+              </div>
+          );
+      };
+
+      // --- APP COMPONENT ---
+      const initialState = {
+          players: Array.from({ length: MAX_PLAYERS }, (_, i) => ({
+              id: i,
+              name: "",
+              onCourt: false,
+              twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0,
+              assist: 0, offReb: 0, defReb: 0, steal: 0, turnover: 0, foul: 0, blocks: 0,
+              plusMinus: 0, points: 0, secondsPlayed: 0,
+          })),
+          events: [],
+          teamScore: 0,
+          oppScore: 0,
+          opponentStats: {
+              twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0,
+              offReb: 0, defReb: 0, foul: 0, turnover: 0, blocks: 0, twoMiss: 0, threeMiss: 0, ftMiss: 0,
+          },
+          currentQuarter: 1,
+      };
+
+      const App = () => {
+          const [players, setPlayers] = useState(initialState.players);
+          const [events, setEvents] = useState([]);
+          const [teamScore, setTeamScore] = useState(0);
+          const [oppScore, setOppScore] = useState(0);
+          const [opponentStats, setOpponentStats] = useState(initialState.opponentStats);
+          const [currentQuarter, setCurrentQuarter] = useState(1);
+          
+          const [teamName, setTeamName] = useState("My Team");
+          const [oppName, setOppName] = useState("Opponent");
+
+          const onTick = useCallback(() => {
+              setPlayers(prevPlayers =>
+                  prevPlayers.map(p =>
+                      p.onCourt ? { ...p, secondsPlayed: p.secondsPlayed + 1 } : p
+                  )
+              );
+          }, []);
+          
+          const currentQuarterLength = getQuarterLength(currentQuarter);
+          const { timeLeft, isRunning, toggleTimer, resetTimer, setTime } = useGameTimer(currentQuarterLength, onTick);
+          
+          // Reset timer if the quarter changes length (Standard vs OT)
+          useEffect(() => {
+              resetTimer();
+          }, [currentQuarter, resetTimer]);
+
+          const pushEvent = (event) => {
+              const currentQuarterStart = getGameStartSecondsForQuarter(currentQuarter);
+              const elapsedInQuarter = currentQuarterLength - timeLeft;
+              
+              const newEvent = {
+                  id: Date.now() + Math.random(),
+                  timestamp: `${getQuarterLabel(currentQuarter)} ${formatTime(timeLeft)}`,
+                  teamScoreSnapshot: teamScore,
+                  oppScoreSnapshot: oppScore,
+                  totalSecondsElapsed: currentQuarterStart + elapsedInQuarter,
+                  ...event,
+              };
+              setEvents(prev => [...prev, newEvent]);
+          };
+
+          const handlePlayerEvent = (playerId, stat) => {
+              const player = players.find(p => p.id === playerId);
+              if (!player) return;
+
+              const name = player.name || `Player ${playerId + 1}`;
+              let desc = '';
+              let teamDelta = 0;
+              const newPlayers = players.map(p => {
+                  if (p.id !== playerId) return p;
+                  const updatedPlayer = { ...p };
+
+                  switch (stat) {
+                      case 'assist': updatedPlayer.assist++; desc = `Assist by ${name}`; break;
+                      case 'offReb': updatedPlayer.offReb++; desc = `Offensive rebound by ${name}`; break;
+                      case 'defReb': updatedPlayer.defReb++; desc = `Defensive rebound by ${name}`; break;
+                      case 'steal': updatedPlayer.steal++; desc = `Steal by ${name}`; break;
+                      case 'turnover': updatedPlayer.turnover++; desc = `Turnover by ${name}`; break;
+                      case 'foul': updatedPlayer.foul++; desc = `Foul by ${name}`; break;
+                      case 'block': updatedPlayer.blocks++; desc = `Block by ${name}`; break;
+                      case '2made': updatedPlayer.twoMade++; updatedPlayer.twoAtt++; updatedPlayer.points += 2; teamDelta = 2; desc = `2 points by ${name}`; break;
+                      case '2miss': updatedPlayer.twoAtt++; desc = `2pt miss by ${name}`; break;
+                      case '3made': updatedPlayer.threeMade++; updatedPlayer.threeAtt++; updatedPlayer.points += 3; teamDelta = 3; desc = `3 points by ${name}`; break;
+                      case '3miss': updatedPlayer.threeAtt++; desc = `3pt miss by ${name}`; break;
+                      case 'ftMade': updatedPlayer.freeMade++; updatedPlayer.freeAtt++; updatedPlayer.points++; teamDelta = 1; desc = `1 free throw by ${name}`; break;
+                      case 'ftMiss': updatedPlayer.freeAtt++; desc = `FT miss by ${name}`; break;
+                  }
+                  return updatedPlayer;
+              });
+              
+              setPlayers(newPlayers.map(p => p.onCourt ? { ...p, plusMinus: p.plusMinus + teamDelta } : p));
+              setTeamScore(s => s + teamDelta);
+              pushEvent({ kind: 'player', type: stat, playerId, description: desc, teamDelta, oppDelta: 0 });
+          };
+
+          const handleOpponentEvent = (stat, value = 0) => {
+              let desc = '';
+              let oppDelta = 0;
+              const newOppStats = { ...opponentStats };
+
+              switch (stat) {
+                  case '2made': newOppStats.twoMade++; newOppStats.twoAtt++; oppDelta = 2; desc = `Opponent +2`; break;
+                  case '3made': newOppStats.threeMade++; newOppStats.threeAtt++; oppDelta = 3; desc = `Opponent +3`; break;
+                  case 'ftMade': newOppStats.freeMade++; newOppStats.freeAtt++; oppDelta = 1; desc = `Opponent FT +1`; break;
+                  case '2miss': newOppStats.twoAtt++; newOppStats.twoMiss++; desc = `Opponent 2pt miss`; break;
+                  case '3miss': newOppStats.threeAtt++; newOppStats.threeMiss++; desc = `Opponent 3pt miss`; break;
+                  case 'ftMiss': newOppStats.freeAtt++; newOppStats.ftMiss++; desc = `Opponent FT miss`; break;
+                  case 'offReb': newOppStats.offReb++; desc = `Opponent offensive rebound`; break;
+                  case 'defReb': newOppStats.defReb++; desc = `Opponent defensive rebound`; break;
+                  case 'foul': newOppStats.foul++; desc = `Opponent foul`; break;
+                  case 'turnover': newOppStats.turnover++; desc = `Opponent turnover`; break;
+                  case 'block': newOppStats.blocks++; desc = `Opponent block`; break;
+              }
+
+              setOpponentStats(newOppStats);
+              if (oppDelta > 0) {
+                  setOppScore(s => s + oppDelta);
+                  setPlayers(players.map(p => p.onCourt ? { ...p, plusMinus: p.plusMinus - oppDelta } : p));
+              }
+              pushEvent({ kind: 'opponent', type: stat, description: desc, teamDelta: 0, oppDelta });
+          };
+          
+          const handleAdjustScore = (team, delta) => {
+              if (team === 'team') {
+                  setTeamScore(s => s + delta);
+                  setPlayers(players.map(p => p.onCourt ? { ...p, plusMinus: p.plusMinus + delta } : p));
+                  pushEvent({ kind: 'correction', type: 'teamAdjust', description: `Correction Team ${delta > 0 ? '+' : ''}${delta}`, teamDelta: delta, oppDelta: 0 });
+              } else {
+                  setOppScore(s => s + delta);
+                  setPlayers(players.map(p => p.onCourt ? { ...p, plusMinus: p.plusMinus - delta } : p));
+                  pushEvent({ kind: 'correction', type: 'oppAdjust', description: `Correction Opponent ${delta > 0 ? '+' : ''}${delta}`, teamDelta: 0, oppDelta: delta });
+              }
+          };
+          
+          const handleUndo = () => {
+              if (events.length === 0) return;
+              alert("Undo functionality requires a more robust state management strategy (like useReducer with state history) to be implemented correctly. For now, it only removes the event from the log.");
+              setEvents(prev => prev.slice(0, -1));
+          };
+
+          const handleToggleOnCourt = (playerId) => {
+              setPlayers(players.map(p => p.id === playerId ? { ...p, onCourt: !p.onCourt } : p));
+              const onCourtPlayers = players.filter(p => p.id === playerId ? !p.onCourt : p.onCourt).filter(p => p.onCourt);
+              const desc = `Substitution - on court: ${onCourtPlayers.map(p => p.name || `Player ${p.id+1}`).join(', ')}`;
+              pushEvent({ kind: 'substitution', type: 'sub', description: desc, teamDelta: 0, oppDelta: 0 });
+          };
+          
+          const handleUpdatePlayerName = (playerId, name) => {
+              setPlayers(players.map(p => p.id === playerId ? { ...p, name } : p));
+          };
+
+          const handleAutoFillNames = () => {
+              setPlayers(players.map((p, i) => ({ ...p, name: SAMPLE_NAMES[i] || `Player ${i + 1}` })));
+          };
+
+          const handleSetFiveOnCourt = () => {
+              let count = 0;
+              const newPlayers = [...players];
+              for(let i = 0; i < newPlayers.length; i++) {
+                  if(count < 5) {
+                      newPlayers[i].onCourt = true;
+                      count++;
+                  } else {
+                      newPlayers[i].onCourt = false;
+                  }
+              }
+              setPlayers(newPlayers);
+              const onCourtPlayers = newPlayers.filter(p => p.onCourt);
+              const desc = `Set 5 on court: ${onCourtPlayers.map(p => p.name || `Player ${p.id+1}`).join(', ')}`;
+              pushEvent({ kind: 'substitution', type: 'sub', description: desc, teamDelta: 0, oppDelta: 0 });
+          };
+
+          const handleQuarterChange = (q) => {
+              if(isRunning) toggleTimer();
+              setCurrentQuarter(q);
+              // Timer reset is handled by useEffect on currentQuarter change
+          }
+
+          const handleImportCSV = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                const text = event.target.result;
+                const lines = text.split(/\r?\n/);
+                const dataRows = lines.map(line => {
+                     // Split by quote-comma-quote pattern
+                     const regex = /(?:^|,)(?:"([^"]*)"|([^",]*))/g;
+                     const cols = [];
+                     let match;
+                     while(match = regex.exec(line)){
+                         let val = match[1] || match[2] || '';
+                         val = val.replace(/^"|"$/g, '').replace(/""/g, '"');
+                         cols.push(val);
+                     }
+                     // Filter out empty regex matches that might occur at end of line
+                     return cols.filter((c, i) => i < cols.length -1 || c !== undefined); 
+                }).filter(r => r.length > 5);
+
+                const newPlayers = [...players].map(p => ({
+                    ...p, 
+                    twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0,
+                    assist: 0, offReb: 0, defReb: 0, steal: 0, turnover: 0, foul: 0, blocks: 0,
+                    plusMinus: 0, points: 0, secondsPlayed: 0, name: p.name
+                }));
+                
+                const newOppStats = {
+                    twoMade: 0, twoAtt: 0, threeMade: 0, threeAtt: 0, freeMade: 0, freeAtt: 0,
+                    offReb: 0, defReb: 0, foul: 0, turnover: 0, blocks: 0, twoMiss: 0, threeMiss: 0, ftMiss: 0,
+                };
+
+                // Helper to safely parse int
+                const pInt = (val) => parseInt(val, 10) || 0;
+
+                let pIndex = 0;
+                dataRows.forEach((row, i) => {
+                    if (i === 0) return; // Skip Header
+
+                    const name = row[0];
+                    if (name === "OPPONENT") {
+                        newOppStats.twoMade = pInt(row[3]);
+                        newOppStats.twoAtt = pInt(row[4]);
+                        newOppStats.threeMade = pInt(row[6]);
+                        newOppStats.threeAtt = pInt(row[7]);
+                        newOppStats.freeMade = pInt(row[9]);
+                        newOppStats.freeAtt = pInt(row[10]);
+                        // FG cols skipped
+                        newOppStats.offReb = pInt(row[16]);
+                        newOppStats.defReb = pInt(row[17]);
+                        newOppStats.blocks = pInt(row[20]);
+                        newOppStats.turnover = pInt(row[21]);
+                        newOppStats.foul = pInt(row[22]);
+                        
+                        // Miss columns if present (indices based on provided CSV)
+                        if (row.length > 29) {
+                            newOppStats.twoMiss = pInt(row[29]);
+                            newOppStats.threeMiss = pInt(row[30]);
+                            newOppStats.ftMiss = pInt(row[31]);
+                        } else {
+                            // Infer from att - made
+                            newOppStats.twoMiss = newOppStats.twoAtt - newOppStats.twoMade;
+                            newOppStats.threeMiss = newOppStats.threeAtt - newOppStats.threeMade;
+                            newOppStats.ftMiss = newOppStats.freeAtt - newOppStats.freeMade;
+                        }
+
+                    } else if (pIndex < MAX_PLAYERS) {
+                        // Assume rows match player list order or fill slots
+                        const p = newPlayers[pIndex];
+                        p.name = name;
+                        p.secondsPlayed = minStrToSec(row[1]);
+                        p.points = pInt(row[2]);
+                        p.twoMade = pInt(row[3]);
+                        p.twoAtt = pInt(row[4]);
+                        p.threeMade = pInt(row[6]);
+                        p.threeAtt = pInt(row[7]);
+                        p.freeMade = pInt(row[9]);
+                        p.freeAtt = pInt(row[10]);
+                        
+                        p.assist = pInt(row[15]);
+                        p.offReb = pInt(row[16]);
+                        p.defReb = pInt(row[17]);
+                        p.steal = pInt(row[19]);
+                        p.blocks = pInt(row[20]);
+                        p.turnover = pInt(row[21]);
+                        p.foul = pInt(row[22]);
+                        p.plusMinus = pInt(row[23]);
+
+                        pIndex++;
+                    }
+                });
+                
+                // Recalculate Scores
+                const newTeamScore = newPlayers.reduce((sum, p) => sum + p.points, 0);
+                const newOppScore = (newOppStats.twoMade * 2) + (newOppStats.threeMade * 3) + newOppStats.freeMade;
+
+                setPlayers(newPlayers);
+                setOpponentStats(newOppStats);
+                setTeamScore(newTeamScore);
+                setOppScore(newOppScore);
+                
+                // Reset events since they don't match the imported stats
+                setEvents([{
+                    id: Date.now(),
+                    timestamp: "Import",
+                    description: "Stats imported from CSV",
+                    teamScoreSnapshot: newTeamScore,
+                    oppScoreSnapshot: newOppScore,
+                    totalSecondsElapsed: 0,
+                    teamDelta: 0,
+                    oppDelta: 0
+                }]);
+                
+                // Clear input
+                e.target.value = '';
+            };
+            reader.readAsText(file);
+          };
+          
+          return (
+              <div className="container mx-auto p-4 max-w-7xl">
+                  <header className="mb-6 flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+                      <div>
+                          <h1 className="text-3xl font-bold text-slate-900">Basketball Stat Tracker</h1>
+                          <p className="text-slate-500 mt-1">
+                              Real-time game tracking. Timer, play-by-play, boxscore, and more.
+                          </p>
+                      </div>
+                      <div className="flex flex-col gap-2 w-full md:w-auto">
+                          <div className="flex items-center gap-2">
+                              <input 
+                                  type="text" 
+                                  value={teamName} 
+                                  onChange={(e) => setTeamName(e.target.value)} 
+                                  className="border border-slate-300 rounded px-2 py-1 text-sm font-semibold text-slate-700 w-32 focus:ring-2 focus:ring-blue-500 outline-none"
+                                  placeholder="My Team"
+                              />
+                              <span className="text-xs font-bold text-slate-400">VS</span>
+                              <input 
+                                  type="text" 
+                                  value={oppName} 
+                                  onChange={(e) => setOppName(e.target.value)} 
+                                  className="border border-slate-300 rounded px-2 py-1 text-sm font-semibold text-slate-700 w-32 focus:ring-2 focus:ring-red-500 outline-none"
+                                  placeholder="Opponent"
+                              />
+                          </div>
+                          <button 
+                              onClick={() => generatePDF(teamName, oppName, players, opponentStats, events)}
+                              className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors w-full"
+                          >
+                              <DownloadIcon />
+                              Download Report PDF
+                          </button>
+                      </div>
+                  </header>
+                  
+                  <main className="space-y-6">
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                          <div className="lg:col-span-2">
+                              <TimerControl
+                                  timeLeft={timeLeft}
+                                  isRunning={isRunning}
+                                  currentQuarter={currentQuarter}
+                                  teamScore={teamScore}
+                                  oppScore={oppScore}
+                                  opponentStats={opponentStats}
+                                  onToggleTimer={toggleTimer}
+                                  onResetTimer={resetTimer}
+                                  onSetTime={setTime}
+                                  onQuarterChange={handleQuarterChange}
+                                  onOpponentEvent={handleOpponentEvent}
+                                  onAdjustScore={handleAdjustScore}
+                                  onUndo={handleUndo}
+                              />
+                          </div>
+                          <PlayByPlay events={events} onClear={() => setEvents([])} />
+                      </div>
+                      
+                      <PlayersList
+                          players={players}
+                          onPlayerEvent={handlePlayerEvent}
+                          onToggleOnCourt={handleToggleOnCourt}
+                          onUpdatePlayerName={handleUpdatePlayerName}
+                          onAutoFillNames={handleAutoFillNames}
+                          onSetFiveOnCourt={handleSetFiveOnCourt}
+                      />
+                      
+                      <div className="grid grid-cols-1 gap-6">
+                          <BoxScore 
+                            players={players} 
+                            opponentStats={opponentStats} 
+                            onExport={() => exportBoxscoreCSV(players, opponentStats, currentQuarter)}
+                            onImport={handleImportCSV}
+                           />
+                          <TeamTotals players={players} opponentStats={opponentStats} />
+                      </div>
+                  </main>
+              </div>
+          );
+      };
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(
+          <React.StrictMode>
+              <App />
+          </React.StrictMode>
+      );
+    </script>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>

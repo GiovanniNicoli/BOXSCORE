@@ -1,0 +1,5 @@
+{
+  "name": "Basketball Stat Tracker",
+  "description": "A comprehensive web application for tracking basketball game statistics in real-time. It features a game timer, play-by-play logging, individual player stat tracking with a horizontal scrolling interface, a detailed box score, and team total summaries. Built with React and TypeScript for a modern, responsive user experience.",
+  "requestFramePermissions": []
+}
