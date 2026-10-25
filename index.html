@@ -1330,7 +1330,13 @@ const App = () => {
       teamScoreSnapshot: teamScore,
       oppScoreSnapshot: oppScore,
       totalSecondsElapsed: currentQuarterStart + elapsedInQuarter,
-      ...event
+      ...event,
+      stateBefore: {
+        players: players.map(p => ({ ...p })),
+        opponentStats: { ...opponentStats },
+        teamScore,
+        oppScore
+      }
     };
     setEvents(prev => [...prev, newEvent]);
   };
@@ -1532,8 +1538,21 @@ const App = () => {
   };
   const handleUndo = () => {
     if (events.length === 0) return;
-    alert("Undo functionality requires a more robust state management strategy (like useReducer with state history) to be implemented correctly. For now, it only removes the event from the log.");
-    setEvents(prev => prev.slice(0, -1));
+    const lastEvent = events[events.length - 1];
+    const snapshot = lastEvent.stateBefore;
+    if (!snapshot) {
+      alert("This entry cannot be undone.");
+      return;
+    }
+    setPlayers(snapshot.players.map((previousPlayer, index) => ({
+      ...previousPlayer,
+      name: players[index]?.name ?? previousPlayer.name,
+      secondsPlayed: players[index]?.secondsPlayed ?? previousPlayer.secondsPlayed
+    })));
+    setOpponentStats(snapshot.opponentStats);
+    setTeamScore(snapshot.teamScore);
+    setOppScore(snapshot.oppScore);
+    setEvents(previousEvents => previousEvents.slice(0, -1));
   };
   const handleToggleOnCourt = playerId => {
     setPlayers(players.map(p => p.id === playerId ? {
@@ -1715,6 +1734,12 @@ const App = () => {
         id: Date.now(),
         timestamp: "Import",
         description: "Stats imported from CSV",
+        stateBefore: {
+          players: players.map(p => ({ ...p })),
+          opponentStats: { ...opponentStats },
+          teamScore,
+          oppScore
+        },
         teamScoreSnapshot: newTeamScore,
         oppScoreSnapshot: newOppScore,
         totalSecondsElapsed: 0,
@@ -1800,6 +1825,6 @@ const App = () => {
 };
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(/*#__PURE__*/React.createElement(React.StrictMode, null, /*#__PURE__*/React.createElement(App, null)));
-    </script>
+</script>
 </body>
 </html>
